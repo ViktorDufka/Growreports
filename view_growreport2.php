@@ -99,6 +99,61 @@ try {
     }
 }
 
+// ========== AUTO-CREATE TABULKY PRO HNOJIVO ==========
+try {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS growreport_hnojeno2 (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        week_id INT NOT NULL,
+        day_number TINYINT NOT NULL,
+        fertilizer_type VARCHAR(10) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        amount DECIMAL(6,1) NOT NULL DEFAULT 0,
+        is_custom TINYINT NOT NULL DEFAULT 0,
+        UNIQUE KEY unique_week_day_name (week_id, day_number, name),
+        FOREIGN KEY (week_id) REFERENCES growreport_weeks2(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+} catch (Throwable $e) {
+    try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS growreport_hnojeno2 (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            week_id INT NOT NULL,
+            day_number TINYINT NOT NULL,
+            fertilizer_type VARCHAR(10) NOT NULL,
+            name VARCHAR(100) NOT NULL,
+            amount DECIMAL(6,1) NOT NULL DEFAULT 0,
+            is_custom TINYINT NOT NULL DEFAULT 0,
+            UNIQUE KEY unique_week_day_name (week_id, day_number, name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    } catch (Throwable $e2) {
+        error_log("Hnojeno tabulka: " . $e2->getMessage());
+    }
+}
+
+try {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS growreport_custom_hnojeno2 (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        report_id INT NOT NULL,
+        fertilizer_type VARCHAR(10) NOT NULL,
+        item_index TINYINT NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        UNIQUE KEY unique_report_type_idx (report_id, fertilizer_type, item_index),
+        FOREIGN KEY (report_id) REFERENCES growreports2(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+} catch (Throwable $e) {
+    try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS growreport_custom_hnojeno2 (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            report_id INT NOT NULL,
+            fertilizer_type VARCHAR(10) NOT NULL,
+            item_index TINYINT NOT NULL,
+            name VARCHAR(100) NOT NULL,
+            UNIQUE KEY unique_report_type_idx (report_id, fertilizer_type, item_index)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    } catch (Throwable $e2) {
+        error_log("Custom hnojeno tabulka: " . $e2->getMessage());
+    }
+}
+
 if ($growreport_id === 0) {
     if ($action !== '') vg2_json(['success' => false, 'message' => 'ID growreportu není nastaveno.']);
     die("ID growreportu není nastaveno.");
@@ -178,6 +233,11 @@ if ($action !== '') {
             $step = 'mazání zalévání';
             try {
                 $pdo->prepare("DELETE FROM growreport_watering2 WHERE week_id=:wid")->execute(['wid' => $row['id']]);
+            } catch (Throwable $e) { /* tabulka nemusí existovat */ }
+
+            $step = 'mazání hnojení';
+            try {
+                $pdo->prepare("DELETE FROM growreport_hnojeno2 WHERE week_id=:wid")->execute(['wid' => $row['id']]);
             } catch (Throwable $e) { /* tabulka nemusí existovat */ }
 
             $step = 'mazání týdne';
@@ -271,6 +331,16 @@ if ($action !== '') {
             }
 
             $hnojeno = array_filter(array_map('intval', explode(',', (string)($week['hnojeno'] ?? ''))));
+            try {
+                $hDaysStmt = $pdo->prepare("SELECT DISTINCT day_number FROM growreport_hnojeno2 WHERE week_id=:wid");
+                $hDaysStmt->execute(['wid' => $weekId]);
+                $dbHnojDays = $hDaysStmt->fetchAll(PDO::FETCH_COLUMN);
+                foreach ($dbHnojDays as $dhd) {
+                    if (!in_array((int)$dhd, $hnojeno, true)) {
+                        $hnojeno[] = (int)$dhd;
+                    }
+                }
+            } catch (Throwable $e) {}
 
             $pdo->prepare("DELETE FROM growreport_days2 WHERE week_id=:wid")->execute(['wid' => $weekId]);
             $ins = $pdo->prepare("INSERT INTO growreport_days2 (week_id, day_number, zalito, hnojeno) VALUES (:wid, :dn, 0, :h)");
@@ -429,6 +499,126 @@ if ($action !== '') {
         vg2_json(['success' => true, 'total' => $total]);
     }
 
+    // --- ULOŽIT HNOJIVO PRO DEN ---
+    if ($action === 'save_hnojeno') {
+        $wn = (int)($json['week'] ?? 0);
+        $day = (int)($json['day'] ?? 0);
+        $items = $json['items'] ?? [];
+        $customNames = $json['custom_names'] ?? null;
+
+        if ($day < 1 || $day > 7) vg2_json(['success' => false, 'message' => 'Neplatný den.']);
+
+        $weekId = $getWeekId($wn);
+        if (!$weekId) vg2_json(['success' => false, 'message' => 'Týden nebyl nalezen.']);
+
+        if (count($items) > 20) {
+            vg2_json(['success' => false, 'message' => 'Lze uložit maximálně 20 položek hnojiv.']);
+        }
+
+        $totalLiquid = 0.0;
+        $totalDry = 0;
+        $savedItems = [];
+
+        try {
+            $pdo->beginTransaction();
+
+            if (is_array($customNames)) {
+                $pdo->prepare("DELETE FROM growreport_custom_hnojeno2 WHERE report_id=:rid")->execute(['rid' => $growreport_id]);
+                $insCust = $pdo->prepare("INSERT INTO growreport_custom_hnojeno2 (report_id, fertilizer_type, item_index, name)
+                                          VALUES (:rid, :ft, :idx, :nm)");
+                foreach (['liquid', 'dry'] as $ft) {
+                    $list = $customNames[$ft] ?? [];
+                    if (is_array($list)) {
+                        foreach ($list as $idx => $nm) {
+                            $nm = mb_substr(trim((string)$nm), 0, 100);
+                            if ($nm !== '') {
+                                $insCust->execute([
+                                    'rid' => $growreport_id,
+                                    'ft' => $ft,
+                                    'idx' => (int)$idx,
+                                    'nm' => $nm
+                                ]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            $pdo->prepare("DELETE FROM growreport_hnojeno2 WHERE week_id=:wid AND day_number=:dn")
+                ->execute(['wid' => $weekId, 'dn' => $day]);
+
+            $ins = $pdo->prepare("INSERT INTO growreport_hnojeno2 (week_id, day_number, fertilizer_type, name, amount, is_custom)
+                                  VALUES (:wid, :dn, :ft, :nm, :amt, :ic)");
+
+            foreach ($items as $item) {
+                $name = mb_substr(trim((string)($item['name'] ?? '')), 0, 100);
+                if ($name === '') continue;
+
+                $type = ($item['type'] ?? '') === 'dry' ? 'dry' : 'liquid';
+                $isCustom = !empty($item['is_custom']) ? 1 : 0;
+
+                if ($type === 'liquid') {
+                    $amt = round(floatval($item['amount'] ?? 0) * 2) / 2;
+                    if ($amt < 0.5 || $amt > 500) continue;
+                    $ins->execute([
+                        'wid' => $weekId,
+                        'dn' => $day,
+                        'ft' => 'liquid',
+                        'nm' => $name,
+                        'amt' => $amt,
+                        'ic' => $isCustom
+                    ]);
+                    $totalLiquid += $amt;
+                    $savedItems[] = [
+                        'type' => 'liquid',
+                        'name' => $name,
+                        'amount' => $amt,
+                        'is_custom' => $isCustom
+                    ];
+                } else {
+                    $amt = (int)($item['amount'] ?? 0);
+                    if ($amt < 1 || $amt > 30) continue;
+                    $ins->execute([
+                        'wid' => $weekId,
+                        'dn' => $day,
+                        'ft' => 'dry',
+                        'nm' => $name,
+                        'amt' => $amt,
+                        'ic' => $isCustom
+                    ]);
+                    $totalDry += $amt;
+                    $savedItems[] = [
+                        'type' => 'dry',
+                        'name' => $name,
+                        'amount' => $amt,
+                        'is_custom' => $isCustom
+                    ];
+                }
+            }
+
+            $hasHnoj = ($totalLiquid > 0 || $totalDry > 0) ? 1 : 0;
+            $stDay = $pdo->prepare("INSERT INTO growreport_days2 (week_id, day_number, zalito, hnojeno)
+                                    VALUES (:wid, :dn, 0, :h)
+                                    ON DUPLICATE KEY UPDATE hnojeno=VALUES(hnojeno)");
+            $stDay->execute(['wid' => $weekId, 'dn' => $day, 'h' => $hasHnoj]);
+
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            error_log("save_hnojeno chyba: " . $e->getMessage());
+            vg2_json(['success' => false, 'message' => 'Chyba databáze při ukládání hnojení: ' . $e->getMessage()]);
+        }
+
+        vg2_json([
+            'success' => true,
+            'total_liquid' => $totalLiquid,
+            'total_dry' => $totalDry,
+            'items' => $savedItems
+        ]);
+    }
+
     if ($action === 'share') {
         $st = $pdo->prepare("UPDATE growreports2 SET share_enabled=1, share_date=NOW() WHERE id=:id AND user_id=:uid");
         $st->execute(['id' => $growreport_id, 'uid' => $_SESSION['user_id']]);
@@ -459,12 +649,62 @@ try {
     error_log("načtení květináčů: " . $e->getMessage());
 }
 
+// Načtení custom hnojiv
+$customHnojenoConfig = ['liquid' => [], 'dry' => []];
+try {
+    $chs = $pdo->prepare("SELECT fertilizer_type, item_index, name FROM growreport_custom_hnojeno2 WHERE report_id=:rid ORDER BY item_index ASC");
+    $chs->execute(['rid' => $growreport_id]);
+    foreach ($chs->fetchAll(PDO::FETCH_ASSOC) as $cr) {
+        $ft = $cr['fertilizer_type'] === 'dry' ? 'dry' : 'liquid';
+        $customHnojenoConfig[$ft][] = $cr['name'];
+    }
+} catch (Throwable $e) {
+    error_log("načtení custom hnojiv: " . $e->getMessage());
+}
+
 foreach ($weeks as &$w) {
+    // Načtení hnojení
+    $w['hnojeno'] = [];
+    $w['hnojenoTotals'] = [];
+    $w['hnojenoDays'] = [];
+    try {
+        $hs = $pdo->prepare("SELECT day_number, fertilizer_type, name, amount, is_custom FROM growreport_hnojeno2 WHERE week_id = :wid");
+        $hs->execute(['wid' => $w['id']]);
+        foreach ($hs->fetchAll(PDO::FETCH_ASSOC) as $hr) {
+            $dn = (int)$hr['day_number'];
+            $ft = $hr['fertilizer_type'] === 'dry' ? 'dry' : 'liquid';
+            $amt = (float)$hr['amount'];
+            if (!isset($w['hnojeno'][$dn])) $w['hnojeno'][$dn] = [];
+            $w['hnojeno'][$dn][] = [
+                'type' => $ft,
+                'name' => $hr['name'],
+                'amount' => $amt,
+                'is_custom' => (int)$hr['is_custom']
+            ];
+            if (!isset($w['hnojenoTotals'][$dn])) {
+                $w['hnojenoTotals'][$dn] = ['liquid' => 0.0, 'dry' => 0];
+            }
+            if ($ft === 'liquid') {
+                $w['hnojenoTotals'][$dn]['liquid'] += $amt;
+            } else {
+                $w['hnojenoTotals'][$dn]['dry'] += (int)$amt;
+            }
+        }
+        foreach ($w['hnojenoTotals'] as $dn => $tots) {
+            if ($tots['liquid'] > 0 || $tots['dry'] > 0) {
+                $w['hnojenoDays'][] = $dn;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log("načtení hnojení: " . $e->getMessage());
+    }
+
     $ds = $pdo->prepare("SELECT day_number, zalito, hnojeno FROM growreport_days2 WHERE week_id = :wid");
     $ds->execute(['wid' => $w['id']]);
-    $w['hnojenoDays'] = [];
     foreach ($ds->fetchAll(PDO::FETCH_ASSOC) as $d) {
-        if ($d['hnojeno']) $w['hnojenoDays'][] = (int)$d['day_number'];
+        if ($d['hnojeno'] && !in_array((int)$d['day_number'], $w['hnojenoDays'], true)) {
+            $w['hnojenoDays'][] = (int)$d['day_number'];
+        }
     }
 
     $w['co2'] = [];
@@ -509,6 +749,22 @@ foreach ($weeks as $w) {
     $wn = (int)$w['week_number'];
     $wateringJS[$wn] = $w['watering'];
 }
+
+// Připravit hnojeno data pro JS
+$hnojenoJS = [];
+foreach ($weeks as $w) {
+    $wn = (int)$w['week_number'];
+    $hnojenoJS[$wn] = $w['hnojeno'];
+}
+
+$predefinedLiquid = [
+    'Melasový čaj', 'Moč', 'Kořenový Stimulátor', 'Banán tekutý', 'Banán tuhý',
+    'Kopřiva-Řasa', 'Ptačí trus', 'Kukuřice enzym', 'Pivní enzym', 'Voda z bongu',
+    'Pivní kvasnice', 'Kvasnice droždí', 'Skořápky hnojivo', 'Pivní kal'
+];
+$predefinedDry = [
+    'Green Crack', 'Popel', 'Vápník-Křemík', 'Popel z trávy', 'Micorize'
+];
 ?>
 <!DOCTYPE html>
 <html lang="cs">
@@ -563,7 +819,7 @@ foreach ($weeks as $w) {
         .day-box .day-co2.on { background-color: gray; }
         .day-box span { position: relative; z-index: 1; color: black; }
         textarea[placeholder="Sekce 2: Text"] { color: blue; border: 2px solid blue; cursor: pointer; }
-        textarea[placeholder="Sekce 3: Text"] { color: brown; border: 2px solid brown; }
+        textarea[placeholder="Sekce 3: Text"] { color: brown; border: 2px solid brown; cursor: pointer; }
         textarea[placeholder="Sekce 1: Text"] { color: black; border: 2px solid black; }
         textarea[placeholder="Sekce 4: Text"] { color: #2E7D32; border: 2px solid #2E7D32; }
         .hidden { display: none; }
@@ -598,6 +854,46 @@ foreach ($weeks as $w) {
         .growreport-content button.zalito-btn .zal-total { font-size: 18px; color: blue; font-weight: 700; }
         .growreport-content button.zalito-btn .zal-total.small { font-size: 13px; }
         .growreport-content button.zalito-btn .zal-plus { font-size: 12px; color: #888; font-weight: 400; }
+
+        /* Hnojeno tlačítka */
+        .growreport-content .hnojeno-cell { height: 40px; width: 100%; border: none !important; display: flex; align-items: center; justify-content: center; }
+        .growreport-content button.hnojeno-btn { margin: 0 auto; padding: 0; width: 90%; height: 36px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #efebe9; border: 1px solid brown; border-radius: 4px; cursor: pointer; overflow: hidden; white-space: nowrap; }
+        .growreport-content button.hnojeno-btn:hover { background: #d7ccc8; }
+        .growreport-content button.hnojeno-btn:disabled { cursor: default; opacity: 1; }
+        .growreport-content button.hnojeno-btn .hnoj-liquid { font-size: 13px; font-weight: 700; color: #1b5e20; }
+        .growreport-content button.hnojeno-btn .hnoj-dry { font-size: 14px; font-weight: 700; color: brown; }
+        .growreport-content button.hnojeno-btn.has-both .hnoj-liquid { font-size: 10px; line-height: 1.15; }
+        .growreport-content button.hnojeno-btn.has-both .hnoj-dry { font-size: 11px; line-height: 1.15; }
+        .growreport-content button.hnojeno-btn .hnoj-plus { font-size: 12px; color: #888; font-weight: 400; }
+
+        /* Hnojeno dialog */
+        .hnojeno-dialog-header { background-color: #5D4037; color: white; padding: 12px 20px; text-align: center; }
+        .hnojeno-dialog-header h3 { margin: 0; font-size: 20px; }
+        .hnojeno-dialog-body { padding: 14px 18px; max-height: 75vh; overflow-y: auto; }
+        .hnoj-toggle-bar { display: flex; justify-content: center; gap: 10px; margin-bottom: 12px; }
+        .hnoj-tab-btn { padding: 8px 16px; font-size: 14px; font-weight: 600; border: 2px solid #5D4037; border-radius: 6px; background: white; color: #5D4037; cursor: pointer; transition: all 0.2s; font-family: 'Montserrat', sans-serif; }
+        .hnoj-tab-btn.active { background: #5D4037; color: white; }
+        .hnoj-table-container { display: flex; gap: 14px; width: 100%; box-sizing: border-box; }
+        .hnoj-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+        .hnoj-col-header { padding: 8px 10px; border-radius: 4px; font-weight: 700; font-size: 13px; text-align: center; margin-bottom: 8px; }
+        .hnoj-col-header.liquid { background-color: #e8f5e9; color: #1b5e20; border: 1px solid #c8e6c9; }
+        .hnoj-col-header.dry { background-color: #efebe9; color: #5D4037; border: 1px solid #d7ccc8; }
+        .hnoj-list { max-height: 340px; overflow-y: auto; padding-right: 4px; display: flex; flex-direction: column; gap: 5px; }
+        .hnoj-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; background: #fafafa; border: 1px solid #e0e0e0; border-radius: 4px; gap: 6px; box-sizing: border-box; }
+        .hnoj-row:hover { background: #f5f5f5; }
+        .hnoj-row-left { display: flex; align-items: center; gap: 8px; cursor: pointer; flex: 1; min-width: 0; }
+        .hnoj-row-left input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; flex-shrink: 0; margin: 0; }
+        .hnoj-row-left .hnoj-name { font-size: 13px; font-weight: 500; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .hnoj-custom-name { flex: 1; min-width: 0; padding: 4px 6px; font-size: 12px; border: 1px solid #ccc; border-radius: 3px; font-family: 'Montserrat', sans-serif; }
+        .hnoj-input-wrap { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+        .hnoj-step-btn { width: 22px; height: 26px; border: 1px solid #bbb; background: #eee; border-radius: 3px; font-weight: bold; cursor: pointer; font-size: 14px; padding: 0; line-height: 1; display: flex; align-items: center; justify-content: center; }
+        .hnoj-step-btn:hover { background: #ddd; }
+        .hnoj-qty { width: 54px; height: 26px; padding: 2px 4px; text-align: center; border: 1px solid #bbb; border-radius: 3px; font-size: 12px; box-sizing: border-box; font-family: 'Montserrat', sans-serif; }
+        .hnoj-qty:disabled { background: #f0f0f0; color: #999; }
+        .hnoj-unit { font-size: 11px; color: #666; width: 28px; text-align: left; padding-left: 2px; }
+        .hnoj-totals-bar { display: flex; justify-content: space-around; padding: 12px 10px 4px; margin-top: 10px; border-top: 1px solid #eee; font-size: 15px; font-weight: 600; }
+        .hnoj-total-liquid { color: #1b5e20; }
+        .hnoj-total-dry { color: #5D4037; }
 
         /* Zvětšené okénko CO2 */
         #co2-tip { position: fixed; display: none; z-index: 5000; pointer-events: none; background: #fff; border: 2px solid #2E7D32; border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,0.35); color: red; font-weight: 700; padding: 6px 10px; box-sizing: border-box; text-align: center; white-space: nowrap; flex-direction: column; align-items: center; justify-content: center; }
@@ -775,12 +1071,27 @@ foreach ($weeks as $w) {
 
                         <!-- HNOJENO -->
                         <div>
-                            <textarea placeholder="Sekce 3: Text" readonly>Hnojeno</textarea>
+                            <textarea placeholder="Sekce 3: Text" readonly <?= $isOwner ? 'onclick="openHnojeno(' . $wn . ', 1)"' : '' ?>>Hnojeno</textarea>
                             <div>
-                                <?php for ($i = 1; $i <= 7; $i++): ?>
-                                    <div>
-                                        <input type="checkbox" id="hnojeno-<?= $wn ?>-<?= $i ?>" value="<?= $i ?>" <?= in_array($i, $week['hnojenoDays']) ? "checked" : "" ?> <?= $isOwner ? '' : 'disabled' ?> onchange="toggleDayValue(<?= $wn ?>, <?= $i ?>, this.checked, 'hnojeno')">
-                                        <label for="hnojeno-<?= $wn ?>-<?= $i ?>"><?= $wn * 7 - (7 - $i) ?></label>
+                                <?php for ($i = 1; $i <= 7; $i++):
+                                    $hTotals = $week['hnojenoTotals'][$i] ?? ['liquid' => 0.0, 'dry' => 0];
+                                    $hLiq = (float)($hTotals['liquid'] ?? 0);
+                                    $hDry = (int)($hTotals['dry'] ?? 0);
+                                    $hLiqStr = ($hLiq == (int)$hLiq) ? (string)(int)$hLiq : number_format($hLiq, 1, '.', '');
+                                    $hasBoth = ($hLiq > 0 && $hDry > 0);
+                                ?>
+                                    <div class="hnojeno-cell">
+                                        <button type="button" class="hnojeno-btn<?= $hasBoth ? ' has-both' : '' ?>" id="hnoj-<?= $wn ?>-<?= $i ?>"
+                                                data-liquid="<?= $hLiqStr ?>"
+                                                data-dry="<?= $hDry ?>"
+                                                <?= $isOwner ? 'onclick="openHnojeno(' . $wn . ', ' . $i . ')"' : 'disabled' ?>>
+                                            <?php if ($hLiq > 0 || $hDry > 0): ?>
+                                                <?php if ($hLiq > 0): ?><span class="hnoj-liquid"><?= $hLiqStr ?> ml</span><?php endif; ?>
+                                                <?php if ($hDry > 0): ?><span class="hnoj-dry"><?= $hDry ?></span><?php endif; ?>
+                                            <?php else: ?>
+                                                <span class="hnoj-plus"><?= $isOwner ? '+' : '' ?></span>
+                                            <?php endif; ?>
+                                        </button>
                                     </div>
                                 <?php endfor; ?>
                             </div>
@@ -922,6 +1233,120 @@ foreach ($weeks as $w) {
     </div>
 </div>
 
+<!-- Hnojeno dialog -->
+<div id="hnojeno-dialog" class="confirm-dialog-overlay">
+    <div class="confirm-dialog" style="max-width: 720px; width: 95%;">
+        <div class="hnojeno-dialog-header">
+            <h3 id="hnojeno-dialog-title">Hnojení – Den 1</h3>
+        </div>
+        <div class="hnojeno-dialog-body">
+            <div class="hnoj-toggle-bar">
+                <button type="button" id="hnoj-tab-pred" class="hnoj-tab-btn active" onclick="showHnojTable('pred')">Předvolená hnojiva</button>
+                <button type="button" id="hnoj-tab-cust" class="hnoj-tab-btn" onclick="showHnojTable('cust')">Vlastní hnojiva</button>
+            </div>
+
+            <!-- Tabulka 1: Předvolená -->
+            <div id="hnoj-table-pred" class="hnoj-table-container">
+                <!-- Sloupec 1: Tekutá hnojiva -->
+                <div class="hnoj-col">
+                    <div class="hnoj-col-header liquid">💧 Tekutá hnojiva (0.5 – 500 ml)</div>
+                    <div class="hnoj-list" id="hnoj-pred-liquid-list">
+                        <?php foreach ($predefinedLiquid as $pName): ?>
+                            <div class="hnoj-row">
+                                <label class="hnoj-row-left">
+                                    <input type="checkbox" class="hnoj-cb" data-type="liquid" data-custom="0" data-name="<?= htmlspecialchars($pName, ENT_QUOTES) ?>" onchange="hnojToggleItem(this)">
+                                    <span class="hnoj-name" title="<?= htmlspecialchars($pName, ENT_QUOTES) ?>"><?= htmlspecialchars($pName) ?></span>
+                                </label>
+                                <div class="hnoj-input-wrap">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, -1)">-</button>
+                                    <input type="number" class="hnoj-qty" min="0.5" max="500" step="0.5" placeholder="ml" disabled oninput="hnojQtyChanged(this)">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, 1)">+</button>
+                                    <span class="hnoj-unit">ml</span>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+
+                <!-- Sloupec 2: Suchá hnojiva -->
+                <div class="hnoj-col">
+                    <div class="hnoj-col-header dry">🌾 Suchá hnojiva (1 – 30 odměrek)</div>
+                    <div class="hnoj-list" id="hnoj-pred-dry-list">
+                        <?php foreach ($predefinedDry as $pName): ?>
+                            <div class="hnoj-row">
+                                <label class="hnoj-row-left">
+                                    <input type="checkbox" class="hnoj-cb" data-type="dry" data-custom="0" data-name="<?= htmlspecialchars($pName, ENT_QUOTES) ?>" onchange="hnojToggleItem(this)">
+                                    <span class="hnoj-name" title="<?= htmlspecialchars($pName, ENT_QUOTES) ?>"><?= htmlspecialchars($pName) ?></span>
+                                </label>
+                                <div class="hnoj-input-wrap">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, -1)">-</button>
+                                    <input type="number" class="hnoj-qty" min="1" max="30" step="1" placeholder="odm." disabled oninput="hnojQtyChanged(this)">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, 1)">+</button>
+                                    <span class="hnoj-unit">odm.</span>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tabulka 2: Vlastní -->
+            <div id="hnoj-table-cust" class="hnoj-table-container" style="display: none;">
+                <!-- Sloupec 1: Vlastní tekutá -->
+                <div class="hnoj-col">
+                    <div class="hnoj-col-header liquid">💧 Vlastní tekutá hnojiva (0.5 – 500 ml)</div>
+                    <div class="hnoj-list" id="hnoj-cust-liquid-list">
+                        <?php for ($ci = 0; $ci < 10; $ci++): ?>
+                            <div class="hnoj-row">
+                                <div class="hnoj-row-left">
+                                    <input type="checkbox" class="hnoj-cb" data-type="liquid" data-custom="1" onchange="hnojToggleItem(this)">
+                                    <input type="text" class="hnoj-custom-name" maxlength="50" placeholder="Vlastní tekuté <?= $ci + 1 ?>" oninput="hnojCustomNameChanged(this)">
+                                </div>
+                                <div class="hnoj-input-wrap">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, -1)">-</button>
+                                    <input type="number" class="hnoj-qty" min="0.5" max="500" step="0.5" placeholder="ml" disabled oninput="hnojQtyChanged(this)">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, 1)">+</button>
+                                    <span class="hnoj-unit">ml</span>
+                                </div>
+                            </div>
+                        <?php endfor; ?>
+                    </div>
+                </div>
+
+                <!-- Sloupec 2: Vlastní suchá -->
+                <div class="hnoj-col">
+                    <div class="hnoj-col-header dry">🌾 Vlastní suchá hnojiva (1 – 30 odměrek)</div>
+                    <div class="hnoj-list" id="hnoj-cust-dry-list">
+                        <?php for ($ci = 0; $ci < 10; $ci++): ?>
+                            <div class="hnoj-row">
+                                <div class="hnoj-row-left">
+                                    <input type="checkbox" class="hnoj-cb" data-type="dry" data-custom="1" onchange="hnojToggleItem(this)">
+                                    <input type="text" class="hnoj-custom-name" maxlength="50" placeholder="Vlastní suché <?= $ci + 1 ?>" oninput="hnojCustomNameChanged(this)">
+                                </div>
+                                <div class="hnoj-input-wrap">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, -1)">-</button>
+                                    <input type="number" class="hnoj-qty" min="1" max="30" step="1" placeholder="odm." disabled oninput="hnojQtyChanged(this)">
+                                    <button type="button" class="hnoj-step-btn" onclick="stepHnojQty(this, 1)">+</button>
+                                    <span class="hnoj-unit">odm.</span>
+                                </div>
+                            </div>
+                        <?php endfor; ?>
+                    </div>
+                </div>
+            </div>
+
+            <div class="hnoj-totals-bar">
+                <span class="hnoj-total-liquid">Celkem tekutá: <strong id="hnoj-total-liquid-val">0</strong> ml</span>
+                <span class="hnoj-total-dry">Celkem suchá: <strong id="hnoj-total-dry-val">0</strong></span>
+            </div>
+        </div>
+        <div class="confirm-actions">
+            <button type="button" id="hnojeno-cancel" class="confirm-button confirm-cancel">Zrušit</button>
+            <button type="button" id="hnojeno-save" class="confirm-button confirm-ok" style="background-color: #5D4037;">Uložit</button>
+        </div>
+    </div>
+</div>
+
 <!-- CO2 tip -->
 <div id="co2-tip"></div>
 
@@ -934,12 +1359,17 @@ foreach ($weeks as $w) {
     let weekToDelete = null;
     let co2Ctx = null;
     let wateringCtx = null;
+    let hnojenoCtx = null;
 
     // Pot config
     let potsConfig = <?= json_encode(array_map(function($p){ return ['pot_number'=>(int)$p['pot_number'],'volume'=>(float)$p['volume']]; }, $potsConfig), JSON_UNESCAPED_UNICODE) ?>;
 
     // Watering data: {week: {day: {pot: amount}}}
     const wateringData = <?= json_encode($wateringJS, JSON_UNESCAPED_UNICODE) ?>;
+
+    // Hnojeno data: {week: {day: [...]}}
+    let customHnojenoConfig = <?= json_encode($customHnojenoConfig, JSON_UNESCAPED_UNICODE) ?>;
+    const hnojenoData = <?= json_encode($hnojenoJS, JSON_UNESCAPED_UNICODE) ?>;
 
     const TARGET_COMPRESSION_RATIO = 6.0;
     const COMPRESSION_QUALITY_START = 85;
@@ -994,6 +1424,12 @@ foreach ($weeks as $w) {
         // Watering dialog
         document.getElementById('watering-cancel').addEventListener('click', closeWatering);
         document.getElementById('watering-ok').addEventListener('click', saveWatering);
+
+        // Hnojeno dialog
+        const hnojCancel = document.getElementById('hnojeno-cancel');
+        if (hnojCancel) hnojCancel.addEventListener('click', closeHnojeno);
+        const hnojSave = document.getElementById('hnojeno-save');
+        if (hnojSave) hnojSave.addEventListener('click', saveHnojeno);
     });
 
     // ========== POT CONFIG ==========
@@ -1229,6 +1665,318 @@ foreach ($weeks as $w) {
             s.textContent = '+';
             btn.appendChild(s);
         }
+    }
+
+    // ========== HNOJENO ==========
+    function showHnojTable(tab) {
+        const isPred = tab === 'pred';
+        document.getElementById('hnoj-table-pred').style.display = isPred ? 'flex' : 'none';
+        document.getElementById('hnoj-table-cust').style.display = isPred ? 'none' : 'flex';
+        document.getElementById('hnoj-tab-pred').classList.toggle('active', isPred);
+        document.getElementById('hnoj-tab-cust').classList.toggle('active', !isPred);
+    }
+
+    function hnojToggleItem(cb) {
+        const row = cb.closest('.hnoj-row');
+        const input = row.querySelector('.hnoj-qty');
+        const isDry = cb.dataset.type === 'dry';
+        const min = isDry ? 1 : 0.5;
+
+        if (cb.checked) {
+            input.disabled = false;
+            let val = parseFloat(input.value);
+            if (isNaN(val) || val <= 0) {
+                input.value = min;
+            }
+            input.focus();
+        } else {
+            input.disabled = true;
+            input.value = '';
+        }
+        updateHnojTotals();
+    }
+
+    function hnojQtyChanged(input) {
+        const row = input.closest('.hnoj-row');
+        const cb = row.querySelector('.hnoj-cb');
+        const isDry = cb.dataset.type === 'dry';
+        const max = isDry ? 30 : 500;
+
+        let val = parseFloat(input.value);
+        if (!isNaN(val) && val > 0) {
+            if (val > max) {
+                val = max;
+                input.value = val;
+            }
+            cb.checked = true;
+            input.disabled = false;
+        } else {
+            cb.checked = false;
+            input.disabled = true;
+            input.value = '';
+        }
+        updateHnojTotals();
+    }
+
+    function hnojCustomNameChanged(input) {
+        // Keeps custom name in sync
+    }
+
+    function stepHnojQty(btn, dir) {
+        const wrap = btn.closest('.hnoj-input-wrap');
+        const input = wrap.querySelector('.hnoj-qty');
+        const row = btn.closest('.hnoj-row');
+        const cb = row.querySelector('.hnoj-cb');
+        const isDry = cb.dataset.type === 'dry';
+        const step = isDry ? 1 : 0.5;
+        const min = isDry ? 1 : 0.5;
+        const max = isDry ? 30 : 500;
+
+        let cur = parseFloat(input.value);
+        if (isNaN(cur) || cur <= 0) {
+            if (dir > 0) {
+                cb.checked = true;
+                input.disabled = false;
+                input.value = min;
+            }
+        } else {
+            cur = Math.round((cur + dir * step) * 10) / 10;
+            if (cur < min) {
+                cb.checked = false;
+                input.disabled = true;
+                input.value = '';
+            } else if (cur > max) {
+                input.value = max;
+            } else {
+                input.value = isDry ? Math.round(cur) : (cur % 1 === 0 ? cur : cur.toFixed(1));
+            }
+        }
+        updateHnojTotals();
+    }
+
+    function updateHnojTotals() {
+        let totLiq = 0;
+        let totDry = 0;
+
+        document.querySelectorAll('#hnojeno-dialog .hnoj-row').forEach(function(row) {
+            const cb = row.querySelector('.hnoj-cb');
+            if (cb && cb.checked) {
+                const input = row.querySelector('.hnoj-qty');
+                const val = parseFloat(input.value) || 0;
+                if (cb.dataset.type === 'dry') {
+                    totDry += Math.round(val);
+                } else {
+                    totLiq += val;
+                }
+            }
+        });
+
+        totLiq = Math.round(totLiq * 10) / 10;
+        document.getElementById('hnoj-total-liquid-val').textContent = (totLiq % 1 === 0) ? totLiq.toString() : totLiq.toFixed(1);
+        document.getElementById('hnoj-total-dry-val').textContent = totDry.toString();
+    }
+
+    function openHnojeno(week, day) {
+        hnojenoCtx = { week: week, day: day };
+        const dayNum = week * 7 - (7 - day);
+        document.getElementById('hnojeno-dialog-title').innerText = 'Hnojení – Den ' + dayNum;
+
+        // Reset all rows
+        document.querySelectorAll('#hnojeno-dialog .hnoj-row').forEach(function(row) {
+            const cb = row.querySelector('.hnoj-cb');
+            if (cb) cb.checked = false;
+            const input = row.querySelector('.hnoj-qty');
+            if (input) {
+                input.value = '';
+                input.disabled = true;
+            }
+        });
+
+        // Populate custom names
+        const custLiqInputs = document.querySelectorAll('#hnoj-cust-liquid-list .hnoj-custom-name');
+        const custDryInputs = document.querySelectorAll('#hnoj-cust-dry-list .hnoj-custom-name');
+        custLiqInputs.forEach(function(inp, i) {
+            inp.value = (customHnojenoConfig && customHnojenoConfig.liquid && customHnojenoConfig.liquid[i]) ? customHnojenoConfig.liquid[i] : '';
+        });
+        custDryInputs.forEach(function(inp, i) {
+            inp.value = (customHnojenoConfig && customHnojenoConfig.dry && customHnojenoConfig.dry[i]) ? customHnojenoConfig.dry[i] : '';
+        });
+
+        // Restore saved items for this day
+        const saved = (hnojenoData[week] && hnojenoData[week][day]) ? hnojenoData[week][day] : [];
+        saved.forEach(function(item) {
+            let matched = false;
+            if (!item.is_custom) {
+                document.querySelectorAll('#hnoj-table-pred .hnoj-cb').forEach(function(cb) {
+                    if (!matched && cb.dataset.name === item.name && cb.dataset.type === item.type) {
+                        cb.checked = true;
+                        const row = cb.closest('.hnoj-row');
+                        const qtyInput = row.querySelector('.hnoj-qty');
+                        qtyInput.disabled = false;
+                        qtyInput.value = item.amount;
+                        matched = true;
+                    }
+                });
+            }
+            if (!matched) {
+                const listId = item.type === 'dry' ? 'hnoj-cust-dry-list' : 'hnoj-cust-liquid-list';
+                const rows = document.querySelectorAll('#' + listId + ' .hnoj-row');
+                let targetRow = null;
+                rows.forEach(function(r) {
+                    if (!targetRow) {
+                        const nameInp = r.querySelector('.hnoj-custom-name');
+                        if (nameInp && nameInp.value.trim() === item.name) {
+                            targetRow = r;
+                        }
+                    }
+                });
+                if (!targetRow) {
+                    rows.forEach(function(r) {
+                        if (!targetRow) {
+                            const nameInp = r.querySelector('.hnoj-custom-name');
+                            if (nameInp && nameInp.value.trim() === '') {
+                                nameInp.value = item.name;
+                                targetRow = r;
+                            }
+                        }
+                    });
+                }
+                if (targetRow) {
+                    const cb = targetRow.querySelector('.hnoj-cb');
+                    cb.checked = true;
+                    const qtyInput = targetRow.querySelector('.hnoj-qty');
+                    qtyInput.disabled = false;
+                    qtyInput.value = item.amount;
+                }
+            }
+        });
+
+        showHnojTable('pred');
+        updateHnojTotals();
+        document.getElementById('hnojeno-dialog').style.display = 'flex';
+    }
+
+    function closeHnojeno() {
+        document.getElementById('hnojeno-dialog').style.display = 'none';
+        hnojenoCtx = null;
+    }
+
+    function renderHnojenoBtn(btn, liquid, dry) {
+        btn.innerHTML = '';
+        const liqVal = parseFloat(liquid) || 0;
+        const dryVal = parseInt(dry, 10) || 0;
+        btn.dataset.liquid = liqVal > 0 ? (liqVal % 1 === 0 ? liqVal.toString() : liqVal.toFixed(1)) : '0';
+        btn.dataset.dry = dryVal > 0 ? dryVal.toString() : '0';
+
+        const hasBoth = liqVal > 0 && dryVal > 0;
+        btn.classList.toggle('has-both', hasBoth);
+
+        if (liqVal > 0 || dryVal > 0) {
+            if (liqVal > 0) {
+                const liqStr = (liqVal % 1 === 0) ? liqVal.toString() : liqVal.toFixed(1);
+                const sLiq = document.createElement('span');
+                sLiq.className = 'hnoj-liquid';
+                sLiq.textContent = liqStr + ' ml';
+                btn.appendChild(sLiq);
+            }
+            if (dryVal > 0) {
+                const sDry = document.createElement('span');
+                sDry.className = 'hnoj-dry';
+                sDry.textContent = dryVal.toString();
+                btn.appendChild(sDry);
+            }
+        } else {
+            const sPlus = document.createElement('span');
+            sPlus.className = 'hnoj-plus';
+            sPlus.textContent = '+';
+            btn.appendChild(sPlus);
+        }
+    }
+
+    function saveHnojeno() {
+        if (!hnojenoCtx) return;
+        const ctx = hnojenoCtx;
+
+        const items = [];
+        let itemCount = 0;
+
+        document.querySelectorAll('#hnojeno-dialog .hnoj-row').forEach(function(row) {
+            const cb = row.querySelector('.hnoj-cb');
+            if (cb && cb.checked) {
+                const isCustom = cb.dataset.custom === '1';
+                let name = '';
+                if (isCustom) {
+                    const nameInput = row.querySelector('.hnoj-custom-name');
+                    name = nameInput ? nameInput.value.trim() : '';
+                } else {
+                    name = cb.dataset.name || '';
+                }
+
+                const input = row.querySelector('.hnoj-qty');
+                let amt = parseFloat(input ? input.value : 0) || 0;
+
+                if (name !== '' && amt > 0) {
+                    if (cb.dataset.type === 'dry') {
+                        amt = Math.min(30, Math.max(1, Math.round(amt)));
+                    } else {
+                        amt = Math.min(500, Math.max(0.5, Math.round(amt * 2) / 2));
+                    }
+                    items.push({
+                        type: cb.dataset.type,
+                        name: name,
+                        amount: amt,
+                        is_custom: isCustom ? 1 : 0
+                    });
+                    itemCount++;
+                }
+            }
+        });
+
+        if (itemCount > 20) {
+            alert('Lze vybrat maximálně 20 položek hnojiv celkem.');
+            return;
+        }
+
+        const customNames = { liquid: [], dry: [] };
+        document.querySelectorAll('#hnoj-cust-liquid-list .hnoj-custom-name').forEach(function(inp) {
+            customNames.liquid.push(inp.value.trim());
+        });
+        document.querySelectorAll('#hnoj-cust-dry-list .hnoj-custom-name').forEach(function(inp) {
+            customNames.dry.push(inp.value.trim());
+        });
+
+        postJson('save_hnojeno', {
+            week: ctx.week,
+            day: ctx.day,
+            items: items,
+            custom_names: customNames
+        })
+        .then(function(data) {
+            if (data.success) {
+                customHnojenoConfig = customNames;
+
+                if (!hnojenoData[ctx.week]) hnojenoData[ctx.week] = {};
+                hnojenoData[ctx.week][ctx.day] = data.items || [];
+
+                const btn = document.getElementById('hnoj-' + ctx.week + '-' + ctx.day);
+                if (btn) {
+                    renderHnojenoBtn(btn, data.total_liquid, data.total_dry);
+                }
+
+                const stripe = document.getElementById('day-hnojeno-' + ctx.week + '-' + ctx.day);
+                if (stripe) {
+                    stripe.style.backgroundColor = (data.total_liquid > 0 || data.total_dry > 0) ? 'brown' : '';
+                }
+
+                closeHnojeno();
+            } else {
+                alert(data.message || 'Chyba při ukládání hnojení.');
+            }
+        })
+        .catch(function(err) {
+            console.error('Chyba při ukládání hnojení:', err);
+            alert('Nastala chyba při ukládání hnojení.');
+        });
     }
 
     // ========== CO2 ==========
@@ -1520,6 +2268,15 @@ foreach ($weeks as $w) {
             var hnojenoDays = [];
             growreport.querySelectorAll('input[id^="hnojeno-"]:checked').forEach(function(input) {
                 hnojenoDays.push(input.value);
+            });
+            growreport.querySelectorAll('button[id^="hnoj-"]').forEach(function(btn) {
+                var liq = parseFloat(btn.dataset.liquid) || 0;
+                var dry = parseInt(btn.dataset.dry, 10) || 0;
+                if (liq > 0 || dry > 0) {
+                    var parts = btn.id.split('-');
+                    var d = parts[2];
+                    if (!hnojenoDays.includes(d)) hnojenoDays.push(d);
+                }
             });
             formData.append('weeks[' + index + '][hnojeno]', hnojenoDays.join(','));
 
